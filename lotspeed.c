@@ -11,12 +11,12 @@
 #include <linux/ktime.h>
 
 // 可调参数（通过 sysfs 动态修改）
-static unsigned long lotserver_rate = 125000000ULL;  // 默认 1Gbps
+static unsigned long lotserver_rate = 1250000000ULL;  // 默认 10Gbps
 static unsigned int lotserver_gain = 30;               // 3.0x 默认增益
 static unsigned int lotserver_min_cwnd = 50;           // 最小拥塞窗口
 static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
-static bool lotserver_adaptive = false;                 // 自适应模式
-static bool lotserver_turbo = true;                   // 涡轮模式
+static bool lotserver_adaptive = true;                 // 自适应模式
+static bool lotserver_turbo = false;                   // 涡轮模式
 static bool lotserver_verbose = true;                  // 详细日志模式
 
 // 参数变更回调 - 速率
@@ -26,8 +26,10 @@ static int param_set_rate(const char *val, const struct kernel_param *kp)
     int ret = param_set_ulong(val, kp);
 
     if (ret == 0 && old_val != lotserver_rate && lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] rate changed: %lu -> %lu (%.2f Gbps)\n",
-                old_val, lotserver_rate, (float)lotserver_rate / 125000000.0);
+        unsigned long gbps_int = lotserver_rate / 125000000;
+        unsigned long gbps_frac = (lotserver_rate % 125000000) * 100 / 125000000;
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] rate changed: %lu -> %lu (%lu.%02lu Gbps)\n",
+                old_val, lotserver_rate, gbps_int, gbps_frac);
     }
     return ret;
 }
@@ -39,8 +41,10 @@ static int param_set_gain(const char *val, const struct kernel_param *kp)
     int ret = param_set_uint(val, kp);
 
     if (ret == 0 && old_val != lotserver_gain && lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] gain changed: %u -> %u (%.1fx)\n",
-                old_val, lotserver_gain, (float)lotserver_gain / 10.0);
+        unsigned int gain_int = lotserver_gain / 10;
+        unsigned int gain_frac = lotserver_gain % 10;
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] gain changed: %u -> %u (%u.%ux)\n",
+                old_val, lotserver_gain, gain_int, gain_frac);
     }
     return ret;
 }
@@ -52,7 +56,7 @@ static int param_set_min_cwnd(const char *val, const struct kernel_param *kp)
     int ret = param_set_uint(val, kp);
 
     if (ret == 0 && old_val != lotserver_min_cwnd && lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] min_cwnd changed: %u -> %u\n",
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] min_cwnd changed: %u -> %u\n",
                 old_val, lotserver_min_cwnd);
     }
     return ret;
@@ -65,7 +69,7 @@ static int param_set_max_cwnd(const char *val, const struct kernel_param *kp)
     int ret = param_set_uint(val, kp);
 
     if (ret == 0 && old_val != lotserver_max_cwnd && lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] max_cwnd changed: %u -> %u\n",
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] max_cwnd changed: %u -> %u\n",
                 old_val, lotserver_max_cwnd);
     }
     return ret;
@@ -78,7 +82,7 @@ static int param_set_adaptive(const char *val, const struct kernel_param *kp)
     int ret = param_set_bool(val, kp);
 
     if (ret == 0 && old_val != lotserver_adaptive && lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] adaptive mode: %s -> %s\n",
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] adaptive mode: %s -> %s\n",
                 old_val ? "ON" : "OFF", lotserver_adaptive ? "ON" : "OFF");
     }
     return ret;
@@ -92,10 +96,10 @@ static int param_set_turbo(const char *val, const struct kernel_param *kp)
 
     if (ret == 0 && old_val != lotserver_turbo && lotserver_verbose) {
         if (lotserver_turbo) {
-            pr_info("lotspeed: [uk0@2025-11-17 12:53:48] ⚡⚡⚡ TURBO MODE ACTIVATED ⚡⚡⚡\n");
+            pr_info("lotspeed: [uk0@2025-11-17 12:57:26] ⚡⚡⚡ TURBO MODE ACTIVATED ⚡⚡⚡\n");
             pr_info("lotspeed: WARNING: Ignoring ALL congestion signals!\n");
         } else {
-            pr_info("lotspeed: [uk0@2025-11-17 12:53:48] Turbo mode DEACTIVATED\n");
+            pr_info("lotspeed: [uk0@2025-11-17 12:57:26] Turbo mode DEACTIVATED\n");
         }
     }
     return ret;
@@ -203,10 +207,15 @@ static void lotspeed_init(struct sock *sk)
     atomic_inc(&active_connections);
 
     if (lotserver_verbose) {
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] NEW connection #%d | rate=%.2f Gbps | gain=%.1fx | mode=%s\n",
+        unsigned long gbps_int = ca->target_rate / 125000000;
+        unsigned long gbps_frac = (ca->target_rate % 125000000) * 100 / 125000000;
+        unsigned int gain_int = ca->cwnd_gain / 10;
+        unsigned int gain_frac = ca->cwnd_gain % 10;
+
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] NEW connection #%d | rate=%lu.%02lu Gbps | gain=%u.%ux | mode=%s\n",
                 atomic_read(&active_connections),
-                (float)ca->target_rate / 125000000.0,
-                (float)ca->cwnd_gain / 10.0,
+                gbps_int, gbps_frac,
+                gain_int, gain_frac,
                 lotserver_turbo ? "TURBO" : (lotserver_adaptive ? "adaptive" : "fixed"));
     }
 }
@@ -222,10 +231,9 @@ static void lotspeed_release(struct sock *sk)
     atomic_add(ca->loss_count, &total_losses);
 
     if (lotserver_verbose && ca->bytes_sent > 1048576) {  // 只记录超过 1MB 的连接
-        pr_info("lotspeed: [uk0@2025-11-17 12:53:48] CLOSED connection | sent=%.2f MB | duration=%llu s | losses=%u | active=%d\n",
-                (float)ca->bytes_sent / 1048576.0,
-                duration,
-                ca->loss_count,
+        u64 mb_sent = ca->bytes_sent >> 20;  // 转换为 MB
+        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] CLOSED connection | sent=%llu MB | duration=%llu s | losses=%u | active=%d\n",
+                mb_sent, duration, ca->loss_count,
                 atomic_read(&active_connections));
     }
 }
@@ -276,9 +284,12 @@ static void lotspeed_adapt_rate(struct sock *sk, const struct rate_sample *rs)
             ca->target_rate = max_t(u64, bw * 15 / 10, lotserver_rate / 4);
             ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 15);
             if (lotserver_verbose) {
-                pr_info("lotspeed: [uk0] adapt DOWN: rate=%.2f Gbps, gain=%.1fx\n",
-                        (float)ca->target_rate / 125000000.0,
-                        (float)ca->cwnd_gain / 10.0);
+                unsigned long gbps_int = ca->target_rate / 125000000;
+                unsigned long gbps_frac = (ca->target_rate % 125000000) * 100 / 125000000;
+                unsigned int gain_int = ca->cwnd_gain / 10;
+                unsigned int gain_frac = ca->cwnd_gain % 10;
+                pr_info("lotspeed: [uk0] adapt DOWN: rate=%lu.%02lu Gbps, gain=%u.%ux\n",
+                        gbps_int, gbps_frac, gain_int, gain_frac);
             }
         }
             // 如果表现良好，逐步恢复
@@ -359,9 +370,13 @@ static void lotspeed_cong_control(struct sock *sk, const struct rate_sample *rs)
 
     // 定期状态输出
     if (lotserver_verbose && ca->rtt_cnt > 0 && ca->rtt_cnt % 1000 == 0) {
-        pr_info("lotspeed: [uk0] STATUS: cwnd=%u | rate=%.2f Gbps | RTT=%u us | gain=%.1fx | losses=%u\n",
-                cwnd, (float)rate / 125000000.0, rtt_us,
-                (float)ca->cwnd_gain / 10.0, ca->loss_count);
+        unsigned long gbps_int = rate / 125000000;
+        unsigned long gbps_frac = (rate % 125000000) * 100 / 125000000;
+        unsigned int gain_int = ca->cwnd_gain / 10;
+        unsigned int gain_frac = ca->cwnd_gain % 10;
+
+        pr_info("lotspeed: [uk0] STATUS: cwnd=%u | rate=%lu.%02lu Gbps | RTT=%u us | gain=%u.%ux | losses=%u\n",
+                cwnd, gbps_int, gbps_frac, rtt_us, gain_int, gain_frac, ca->loss_count);
     }
 }
 
@@ -386,8 +401,10 @@ static void lotspeed_set_state(struct sock *sk, u8 new_state)
             ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
 
             if (lotserver_verbose && (ca->loss_count == 1 || ca->loss_count % 10 == 0)) {
-                pr_info("lotspeed: [uk0] LOSS #%u detected, gain reduced to %.1fx\n",
-                        ca->loss_count, (float)ca->cwnd_gain / 10.0);
+                unsigned int gain_int = ca->cwnd_gain / 10;
+                unsigned int gain_frac = ca->cwnd_gain % 10;
+                pr_info("lotspeed: [uk0] LOSS #%u detected, gain reduced to %u.%ux\n",
+                        ca->loss_count, gain_int, gain_frac);
             }
             break;
 
@@ -486,19 +503,28 @@ static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
 
 static int __init lotspeed_module_init(void)
 {
+    unsigned long gbps_int, gbps_frac;
+    unsigned int gain_int, gain_frac;
+
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
 
     pr_info("╔════════════════════════════════════════════════════════╗\n");
     pr_info("║          LotSpeed v2.0 - 锐速复活版                    ║\n");
-    pr_info("║          Created by uk0 @ 2025-11-17 12:53:48          ║\n");
+    pr_info("║          Created by uk0 @ 2025-11-17 12:57:26          ║\n");
     pr_info("║          Kernel: %u.%u.%u                                ║\n",
             LINUX_VERSION_CODE >> 16,
             (LINUX_VERSION_CODE >> 8) & 0xff,
             LINUX_VERSION_CODE & 0xff);
     pr_info("╚════════════════════════════════════════════════════════╝\n");
+
+    gbps_int = lotserver_rate / 125000000;
+    gbps_frac = (lotserver_rate % 125000000) * 100 / 125000000;
+    gain_int = lotserver_gain / 10;
+    gain_frac = lotserver_gain % 10;
+
     pr_info("Initial Parameters:\n");
-    pr_info("  Rate: %.2f Gbps\n", (float)lotserver_rate / 125000000.0);
-    pr_info("  Gain: %.1fx\n", (float)lotserver_gain / 10.0);
+    pr_info("  Rate: %lu.%02lu Gbps\n", gbps_int, gbps_frac);
+    pr_info("  Gain: %u.%ux\n", gain_int, gain_frac);
     pr_info("  Min/Max CWND: %u/%u\n", lotserver_min_cwnd, lotserver_max_cwnd);
     pr_info("  Adaptive: %s | Turbo: %s | Verbose: %s\n",
             lotserver_adaptive ? "ON" : "OFF",
@@ -510,11 +536,18 @@ static int __init lotspeed_module_init(void)
 
 static void __exit lotspeed_module_exit(void)
 {
+    u64 total_bytes;
+    u64 gb_sent, mb_sent;
+
     tcp_unregister_congestion_control(&lotspeed_ops);
 
-    pr_info("LotSpeed v2.0 unloaded | Stats: connections=%d, sent=%.2f GB, losses=%d\n",
+    total_bytes = atomic64_read(&total_bytes_sent);
+    gb_sent = total_bytes >> 30;  // 转换为 GB (2^30)
+    mb_sent = (total_bytes >> 20) & 0x3FF;  // 余下的 MB
+
+    pr_info("LotSpeed v2.0 unloaded | Stats: connections=%d, sent=%llu.%llu GB, losses=%d\n",
             atomic_read(&active_connections),
-            (float)atomic64_read(&total_bytes_sent) / 1073741824.0,
+            gb_sent, mb_sent * 1000 / 1024,  // 近似小数部分
             atomic_read(&total_losses));
 }
 
