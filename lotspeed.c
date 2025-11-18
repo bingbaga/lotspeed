@@ -507,7 +507,7 @@ static void print_boxed_line(const char *prefix, const char *content)
     int prefix_len = strlen(prefix);
     int content_len = strlen(content);
     int total_len = prefix_len + content_len;
-    int padding = 58 - total_len;  // 58 = 60 - 2个边框字符
+    int padding = 56 - total_len;  // 56 = 60 - 2个边框字符
 
     if (padding < 0) padding = 0;
 
