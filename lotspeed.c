@@ -231,19 +231,39 @@ static void lotspeed_init(struct sock *sk)
 static void lotspeed_release(struct sock *sk)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
-    u64 duration = ktime_get_real_seconds() - ca->start_time;
+    u64 duration;
+
+    // 添加空指针检查
+    if (!ca) {
+        pr_warn("lotspeed: [uk0@2025-11-18 08:04:06] release called with NULL ca\n");
+        atomic_dec(&active_connections);
+        return;
+    }
+
+    // 安全获取 duration
+    if (ca->start_time > 0) {
+        duration = ktime_get_real_seconds() - ca->start_time;
+    } else {
+        duration = 0;
+    }
 
     atomic_dec(&active_connections);
-    atomic_dec(&module_ref_count);
-    atomic64_add(ca->bytes_sent, &total_bytes_sent);
-    atomic_add(ca->loss_count, &total_losses);
 
-    if (lotserver_verbose && ca->bytes_sent > 1048576) {  // 只记录超过 1MB 的连接
-        u64 mb_sent = ca->bytes_sent >> 20;  // 转换为 MB
-        pr_info("lotspeed: [uk0@2025-11-17 12:57:26] CLOSED connection | sent=%llu MB | duration=%llu s | losses=%u | active=%d\n",
-                mb_sent, duration, ca->loss_count,
+    // 只有在有数据时才更新统计
+    if (ca->bytes_sent > 0) {
+        atomic64_add(ca->bytes_sent, &total_bytes_sent);
+    }
+    if (ca->loss_count > 0) {
+        atomic_add(ca->loss_count, &total_losses);
+    }
+
+    if (lotserver_verbose) {
+        pr_info("lotspeed: [uk0@2025-11-18 08:04:06] connection released, active=%d\n",
                 atomic_read(&active_connections));
     }
+
+    // 清理 ca 结构
+    memset(ca, 0, sizeof(struct lotspeed));
 }
 
 // 更新 RTT 统计
@@ -570,29 +590,36 @@ static void __exit lotspeed_module_exit(void)
     u64 total_bytes;
     u64 gb_sent, mb_sent;
     int active_conns;
+    int retry_count = 0;
 
-    pr_info("lotspeed: Beginning module unload at 2025-11-18 07:50:15 by uk0\n");
+    pr_info("lotspeed: [uk0@2025-11-18 08:04:06] Beginning module unload\n");
 
-    // 强制清理所有连接
-    if (force_unload) {
-        pr_warn("lotspeed: FORCE UNLOAD activated, cleaning up forcefully...\n");
-        atomic_set(&active_connections, 0);
-        atomic_set(&module_ref_count, 0);
+    // 先注销算法，防止新连接使用
+    tcp_unregister_congestion_control(&lotspeed_ops);
+    pr_info("lotspeed: Unregistered from TCP stack\n");
+
+    // 等待现有连接释放（最多等待5秒）
+    while (atomic_read(&active_connections) > 0 && retry_count < 50) {
+        pr_info("lotspeed: Waiting for %d connections to close (attempt %d/50)\n",
+                atomic_read(&active_connections), retry_count + 1);
+        msleep(100);  // 等待100ms
+        retry_count++;
     }
 
-    // 先切换默认算法到 cubic
-    pr_info("lotspeed: Switching default algorithm to cubic...\n");
-
-    // 注销拥塞控制算法
-    tcp_unregister_congestion_control(&lotspeed_ops);
-
-    // 等待一下让系统清理
-    msleep(100);
-
     active_conns = atomic_read(&active_connections);
-    if (active_conns > 0 && !force_unload) {
-        pr_warn("lotspeed: Warning - %d active connections still exist\n", active_conns);
-        pr_warn("lotspeed: Use 'echo 1 > /sys/module/lotspeed/parameters/force_unload' to force\n");
+
+    if (active_conns > 0) {
+        pr_err("lotspeed: WARNING - Force unloading with %d active connections!\n", active_conns);
+        pr_err("lotspeed: This may cause system instability!\n");
+
+        if (!force_unload) {
+            pr_err("lotspeed: Refusing to unload. Set force_unload=1 to override\n");
+            pr_err("lotspeed: echo 1 > /sys/module/lotspeed/parameters/force_unload\n");
+
+            // 重新注册以保持稳定
+            tcp_register_congestion_control(&lotspeed_ops);
+            return;  // 拒绝卸载
+        }
     }
 
     total_bytes = atomic64_read(&total_bytes_sent);
@@ -600,13 +627,13 @@ static void __exit lotspeed_module_exit(void)
     mb_sent = (total_bytes >> 20) & 0x3FF;
 
     pr_info("╔════════════════════════════════════════════════════════╗\n");
-    pr_info("║          LotSpeed v2.0 Unloaded Successfully           ║\n");
-    print_boxed_line("          Unloaded at: ", "2025-11-18 07:50:15");
-    print_boxed_line("          By user: ", "uk0");
-    print_boxed_line("          Active Connections: ",
-                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%d", active_conns); buf;}));
-    print_boxed_line("          Total Data Sent: ",
-                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%llu.%llu GB", gb_sent, mb_sent * 1000 / 1024); buf;}));
+    pr_info("║          LotSpeed v2.0 Unloaded                        ║\n");
+    pr_info("║          Time: 2025-11-18 08:04:06                     ║\n");
+    pr_info("║          User: uk0                                     ║\n");
+    pr_info("║          Active Connections: %-26d║\n", active_conns);
+    pr_info("║          Data Sent: %llu.%llu GB%*s║\n",
+            gb_sent, mb_sent * 1000 / 1024,
+            (int)(30 - snprintf(NULL, 0, "%llu.%llu GB", gb_sent, mb_sent * 1000 / 1024)), "");
     pr_info("╚════════════════════════════════════════════════════════╝\n");
 }
 
