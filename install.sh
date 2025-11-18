@@ -330,6 +330,9 @@ safe_uninstall() {
     # 4. 删除管理脚本（最后删除自己）
     echo -e "${GREEN}✓ LotSpeed uninstalled successfully${NC}"
     rm -f /usr/local/bin/lotspeed
+
+    echo -e "${GREEN}✓ Current net.ipv4.tcp_congestion_control ${NC}"
+    sysctl net.ipv4.tcp_congestion_control
 }
 
 show_status() {
