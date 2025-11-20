@@ -9,6 +9,8 @@
 #include <linux/moduleparam.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/kernel.h>
+#include <linux/timer.h>
 
 // 版本兼容性检测 - 修正版本判断逻辑
 // 根据实际测试：6.8.0 使用旧API，6.17+ 使用新API
@@ -26,15 +28,80 @@
 #define OLD_CONG_CONTROL_API 1
 #endif
 
+// 滤波与探测常量
+#define LOTSPEED_BW_EMA_SHIFT        3     // 1/8 EMA
+#define LOTSPEED_BW_DECAY_SHIFT      3     // 窗口最大值衰减 1/8
+#define LOTSPEED_BW_WINDOW_MS        200   // 200ms 窗口更新
+#define LOTSPEED_PROBE_BASE          10000 // BDP 自适应探测基数
+#define LOTSPEED_PROBE_MIN           8
+#define LOTSPEED_PROBE_MAX           80
+#define LOTSPEED_MIN_GAIN            10
+#define LOTSPEED_TURBO_IGNORE_SPAN   3
+
 // 可调参数（通过 sysfs 动态修改）
-static unsigned long lotserver_rate = 125000000ULL;  // 默认 1Gbps
-static unsigned int lotserver_gain = 15;               // 1.5x 默认增益
-static unsigned int lotserver_min_cwnd = 50;           // 最小拥塞窗口
-static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
-static bool lotserver_adaptive = true;                 // 自适应模式
-static bool lotserver_turbo = false;                   // 涡轮模式
-static bool lotserver_verbose = false;                  // 详细日志模式
+static unsigned long lotserver_rate = 125000000ULL;   // 默认 1Gbps
+static unsigned int lotserver_gain = 15;              // 1.5x 默认增益
+static unsigned int lotserver_min_cwnd = 50;          // 最小拥塞窗口
+static unsigned int lotserver_max_cwnd = 10000;       // 最大拥塞窗口
+static bool lotserver_adaptive = true;                // 自适应模式
+static bool lotserver_turbo = false;                  // 涡轮模式
+static bool lotserver_soft_turbo = true;              // 软涡轮（丢包预算）
+static unsigned int lotserver_soft_turbo_budget = 2;  // 可忽略的连续丢包数
+static bool lotserver_verbose = false;                // 详细日志模式
 static bool force_unload = false;
+
+static inline u8 lotspeed_get_turbo_budget(void)
+{
+    return lotserver_soft_turbo ?
+           (u8)clamp_t(unsigned int, lotserver_soft_turbo_budget, 1U, 8U) : 0;
+}
+
+static inline void lotspeed_reset_turbo_budget(struct lotspeed *ca)
+{
+    if (ca) {
+        ca->turbo_budget = lotspeed_get_turbo_budget();
+        ca->turbo_ignore_ref = 0;
+    }
+}
+
+static inline void lotspeed_consume_turbo_ignore(struct lotspeed *ca)
+{
+    if (ca && ca->turbo_ignore_ref > 0)
+        ca->turbo_ignore_ref--;
+}
+
+static inline bool lotspeed_turbo_ignore_active(const struct lotspeed *ca)
+{
+    return ca && ca->turbo_ignore_ref > 0;
+}
+
+static bool lotspeed_turbo_should_ignore(struct lotspeed *ca, const char *reason)
+{
+    if (!ca)
+        return lotserver_turbo;
+
+    ca->turbo_ignore_ref = 0;
+
+    if (!lotserver_turbo)
+        return false;
+
+    if (!lotserver_soft_turbo) {
+        ca->turbo_ignore_ref = LOTSPEED_TURBO_IGNORE_SPAN;
+        return true;
+    }
+
+    if (!ca->turbo_budget)
+        return false;
+
+    ca->turbo_budget--;
+    ca->turbo_ignore_ref = LOTSPEED_TURBO_IGNORE_SPAN;
+    if (lotserver_verbose) {
+        pr_info("lotspeed: soft turbo ignoring %s (budget=%u)\n",
+                reason, ca->turbo_budget);
+    }
+
+    return true;
+}
 
 // 参数变更回调 - 速率
 static int param_set_rate(const char *val, const struct kernel_param *kp)
@@ -178,6 +245,12 @@ MODULE_PARM_DESC(lotserver_turbo, "Turbo mode - ignore all congestion signals");
 module_param(lotserver_verbose, bool, 0644);
 MODULE_PARM_DESC(lotserver_verbose, "Enable verbose logging");
 
+module_param(lotserver_soft_turbo, bool, 0644);
+MODULE_PARM_DESC(lotserver_soft_turbo, "Soft turbo - allow limited loss ignoring before backing off");
+
+module_param(lotserver_soft_turbo_budget, uint, 0644);
+MODULE_PARM_DESC(lotserver_soft_turbo_budget, "Number of consecutive losses Turbo mode may ignore");
+
 // 统计信息
 static atomic_t active_connections = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
@@ -187,15 +260,22 @@ static atomic_t module_ref_count = ATOMIC_INIT(0);
 struct lotspeed {
     u64 target_rate;
     u64 actual_rate;
+    u64 bw_window_max;
+    u64 last_update;
+    u64 bytes_sent;     // 添加字节统计
+    u64 start_time;     // 连接开始时间
     u32 cwnd_gain;
     u32 loss_count;
     u32 rtt_min;
     u32 rtt_cnt;
-    u64 last_update;
-    bool ss_mode;
+    u32 bw_window_stamp;
+    u32 rtt_ema;
+    u32 rtt_var;
     u32 probe_cnt;
-    u64 bytes_sent;     // 添加字节统计
-    u64 start_time;     // 连接开始时间
+    bool ss_mode;
+    u8 turbo_budget;
+    u8 turbo_ignore_ref;
+    u8 reserved;
 };
 
 static struct tcp_congestion_ops lotspeed_ops;
@@ -205,6 +285,7 @@ static void lotspeed_init(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct lotspeed *ca = inet_csk_ca(sk);
+    memset(ca, 0, sizeof(*ca));
 
     // 初始化状态
     tp->snd_ssthresh = lotserver_turbo ? TCP_INFINITE_SSTHRESH : tp->snd_cwnd * 2;
@@ -219,6 +300,8 @@ static void lotspeed_init(struct sock *sk)
     ca->probe_cnt = 0;
     ca->bytes_sent = 0;
     ca->start_time = ktime_get_real_seconds();
+    ca->bw_window_stamp = tcp_jiffies32;
+    lotspeed_reset_turbo_budget(ca);
 
     // 强制开启 pacing
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
@@ -287,6 +370,8 @@ static void lotspeed_update_rtt(struct sock *sk)
     struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
     u32 rtt_us = tp->srtt_us >> 3;
+    s32 delta;
+    u32 abs_delta;
 
     if (!rtt_us || rtt_us == 0)
         return;
@@ -300,6 +385,18 @@ static void lotspeed_update_rtt(struct sock *sk)
     }
 
     ca->rtt_cnt++;
+
+    if (!ca->rtt_ema) {
+        ca->rtt_ema = rtt_us;
+        ca->rtt_var = rtt_us >> 3;
+        return;
+    }
+
+    delta = (s32)rtt_us - (s32)ca->rtt_ema;
+    ca->rtt_ema += delta >> 3;
+
+    abs_delta = delta < 0 ? -delta : delta;
+    ca->rtt_var += ((s32)abs_delta - (s32)ca->rtt_var) >> 2;
 }
 
 // 自适应速率调整
@@ -307,48 +404,103 @@ static void lotspeed_adapt_rate(struct sock *sk, const struct rate_sample *rs)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
-    u64 bw = 0;
+    u64 sample_bw = 0;
+    u64 filtered_bw;
+    u32 rtt_us = tp->srtt_us >> 3;
+    u32 min_rtt = ca->rtt_min ? ca->rtt_min : rtt_us;
+    bool ecn = rs && rs->is_ece;
+    u32 mss = tp->mss_cache ? tp->mss_cache : 1460;
+    u32 window_deadline;
 
     if (!lotserver_adaptive)
-        return;
+        goto rtt_check;
 
-    // 计算实际带宽
+    // 计算实际带宽（瞬时值）
     if (rs && rs->delivered > 0 && rs->interval_us > 0) {
-        bw = (u64)rs->delivered * USEC_PER_SEC;
-        do_div(bw, rs->interval_us);
-        ca->actual_rate = bw;
+        sample_bw = (u64)rs->delivered * USEC_PER_SEC;
+        do_div(sample_bw, rs->interval_us);
 
-        // 更新发送字节数
-        ca->bytes_sent += rs->delivered * tp->mss_cache;
+        // 发送字节统计
+        ca->bytes_sent += (u64)rs->delivered * mss;
 
-        // 如果实际速率远低于目标，可能遇到瓶颈
-        if (bw < ca->target_rate / 2 && ca->loss_count > 0) {
-            // 温和降速
-            ca->target_rate = max_t(u64, bw * 15 / 10, lotserver_rate / 4);
-            ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 15);
+        // 指数滑动平均，抑制抖动
+        if (!ca->actual_rate) {
+            ca->actual_rate = sample_bw;
+        } else {
+            ca->actual_rate -= ca->actual_rate >> LOTSPEED_BW_EMA_SHIFT;
+            ca->actual_rate += sample_bw >> LOTSPEED_BW_EMA_SHIFT;
+        }
+
+        // BBR 风格窗口最大值，探测更高带宽
+        if (!ca->bw_window_max || sample_bw >= ca->bw_window_max) {
+            ca->bw_window_max = sample_bw;
+            ca->bw_window_stamp = tcp_jiffies32;
+        } else {
+            window_deadline = ca->bw_window_stamp +
+                    (u32)msecs_to_jiffies(LOTSPEED_BW_WINDOW_MS);
+            if (time_after32(tcp_jiffies32, window_deadline)) {
+                ca->bw_window_max -= ca->bw_window_max >> LOTSPEED_BW_DECAY_SHIFT;
+                if (ca->bw_window_max < ca->actual_rate)
+                    ca->bw_window_max = ca->actual_rate;
+                ca->bw_window_stamp = tcp_jiffies32;
+            }
+        }
+    }
+
+    filtered_bw = ca->actual_rate ? ca->actual_rate : sample_bw;
+
+    if (filtered_bw) {
+        // 如果实际速率远低于目标且存在丢包，快速降速
+        if (filtered_bw < ca->target_rate / 2 && ca->loss_count > 0) {
+            ca->target_rate = max_t(u64, filtered_bw * 15 / 10, lotserver_rate / 4);
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, LOTSPEED_MIN_GAIN);
             if (lotserver_verbose) {
                 unsigned long gbps_int = ca->target_rate / 125000000;
                 unsigned long gbps_frac = (ca->target_rate % 125000000) * 100 / 125000000;
                 unsigned int gain_int = ca->cwnd_gain / 10;
                 unsigned int gain_frac = ca->cwnd_gain % 10;
-                pr_info("lotspeed: [uk0] adapt DOWN: rate=%lu.%02lu Gbps, gain=%u.%ux\n",
+                pr_info("lotspeed: adapt DOWN: rate=%lu.%02lu Gbps, gain=%u.%ux\n",
                         gbps_int, gbps_frac, gain_int, gain_frac);
             }
         }
-            // 如果表现良好，逐步恢复
-        else if (bw > ca->target_rate * 8 / 10 && ca->loss_count == 0) {
-            ca->target_rate = min_t(u64, ca->target_rate * 11 / 10, lotserver_rate);
-            ca->cwnd_gain = min_t(u32, ca->cwnd_gain + 2, lotserver_gain);
+        // 表现良好，逐步提升到窗口最大值
+        else if (ca->loss_count == 0 &&
+                 filtered_bw > ca->target_rate * 8 / 10) {
+            u64 desired = ca->bw_window_max ?
+                          min(ca->bw_window_max, lotserver_rate) :
+                          lotserver_rate;
+            u64 step = max_t(u64, ca->target_rate >> 3, mss * 8ULL);
+            ca->target_rate = min_t(u64, ca->target_rate + step, desired);
+            ca->cwnd_gain = min_t(u32, ca->cwnd_gain + 1, lotserver_gain);
         }
     }
 
-    // RTT 膨胀检测
-    if (ca->rtt_min && tp->srtt_us >> 3 > ca->rtt_min * 3 / 2) {
-        // RTT 膨胀超过 50%，可能有队列堆积
-        if (!lotserver_turbo) {
-            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+rtt_check:
+    // RTT 膨胀检测：阈值 = minRTT + max(minRTT/3, 1.5~2×方差)
+    if (min_rtt && rtt_us) {
+        u32 var = ca->rtt_var ? ca->rtt_var : min_rtt >> 3;
+        u32 tolerance = min_rtt / 3;
+        u32 var_term = (var * (ecn ? 3 : 4)) >> 1;
+        u32 threshold = min_rtt + max(tolerance, var_term);
+
+        if (!lotserver_turbo && rtt_us > threshold) {
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 2, LOTSPEED_MIN_GAIN);
+        } else if (ca->cwnd_gain < lotserver_gain) {
+            ca->cwnd_gain++;
         }
     }
+}
+
+static u32 lotspeed_probe_threshold(const struct lotspeed *ca, u32 target_cwnd, u32 rtt_us)
+{
+    u32 denom = max(50u, target_cwnd);
+    u32 cwnd_term = clamp_t(u32, LOTSPEED_PROBE_BASE / denom, 4u, 60u);
+    u32 min_rtt = ca->rtt_min ? ca->rtt_min : (rtt_us ? rtt_us : 1000);
+    u32 min_rtt_ms = max(1u, DIV_ROUND_UP(min_rtt, 1000));
+    u32 rtt_term = clamp_t(u32, 50u / min_rtt_ms, 4u, 20u);
+
+    return clamp_t(u32, cwnd_term + rtt_term,
+                   LOTSPEED_PROBE_MIN, LOTSPEED_PROBE_MAX);
 }
 
 // 核心拥塞控制逻辑实现（内部函数）
@@ -361,6 +513,7 @@ static void lotspeed_cong_control_impl(struct sock *sk, const struct rate_sample
     u32 rtt_us = tp->srtt_us >> 3;
     u32 mss = tp->mss_cache;
     u32 target_cwnd;
+    u32 probe_threshold;
 
     // 默认值处理
     if (!rtt_us) rtt_us = 1000;   // 1ms 默认
@@ -379,6 +532,10 @@ static void lotspeed_cong_control_impl(struct sock *sk, const struct rate_sample
     target_cwnd = div64_u64(rate * (u64)rtt_us, (u64)mss * 1000000);
     target_cwnd = div_u64(target_cwnd * ca->cwnd_gain, 10);
 
+    probe_threshold = lotspeed_probe_threshold(ca,
+                                               max_t(u32, target_cwnd, 1),
+                                               rtt_us);
+
     // 慢启动阶段特殊处理
     if (ca->ss_mode && tp->snd_cwnd < tp->snd_ssthresh) {
         // 指数增长
@@ -393,7 +550,7 @@ static void lotspeed_cong_control_impl(struct sock *sk, const struct rate_sample
 
         // 周期性探测更高速率
         ca->probe_cnt++;
-        if (ca->probe_cnt >= 100) {  // 每 100 个 RTT 探测一次
+        if (ca->probe_cnt >= probe_threshold) {
             cwnd = cwnd * 11 / 10;   // 探测 +10%
             ca->probe_cnt = 0;
         }
@@ -411,7 +568,7 @@ static void lotspeed_cong_control_impl(struct sock *sk, const struct rate_sample
     // 改进: 给予 20% 的 Overhead 空间，防止 Pacing 限制了 TCP 本身的突发能力
     // 许多网卡需要小规模的突发来维持高吞吐
     u64 pacing = rate + (rate >> 2); // Rate * 1.25
-    sk->sk_pacing_rate = (rate * 120) / 100;
+    sk->sk_pacing_rate = pacing;
 #endif
 
     // 定期状态输出
@@ -460,22 +617,20 @@ static void lotspeed_set_state(struct sock *sk, u8 new_state)
 
     switch (new_state) {
         case TCP_CA_Loss:
-            // 涡轮模式完全无视丢包
-            if (lotserver_turbo) {
+            // 涡轮模式根据软/硬策略选择是否忽略
+            if (lotspeed_turbo_should_ignore(ca, "loss")) {
+                lotspeed_consume_turbo_ignore(ca);
                 tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
-                if (lotserver_verbose && ca->loss_count % 10 == 0) {
-                    pr_info("lotspeed: [uk0] TURBO: Ignoring loss #%u\n", ca->loss_count + 1);
-                }
                 return;
             }
             // 记录丢包
             ca->loss_count++;
-            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, LOTSPEED_MIN_GAIN);
 
             if (lotserver_verbose && (ca->loss_count == 1 || ca->loss_count % 10 == 0)) {
                 unsigned int gain_int = ca->cwnd_gain / 10;
                 unsigned int gain_frac = ca->cwnd_gain % 10;
-                pr_info("lotspeed: [uk0] LOSS #%u detected, gain reduced to %u.%ux\n",
+                pr_info("lotspeed: LOSS #%u detected, gain reduced to %u.%ux\n",
                         ca->loss_count, gain_int, gain_frac);
             }
             break;
@@ -490,6 +645,7 @@ static void lotspeed_set_state(struct sock *sk, u8 new_state)
         case TCP_CA_Open:
             // 恢复正常
             ca->ss_mode = false;
+            lotspeed_reset_turbo_budget(ca);
             break;
 
         default:
@@ -502,17 +658,24 @@ static u32 lotspeed_ssthresh(struct sock *sk)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
+    u32 thresh;
 
-    // 涡轮模式：永不降速
-    if (lotserver_turbo) {
+    // 硬涡轮：永不降速
+    if (lotserver_turbo && !lotserver_soft_turbo) {
+        return TCP_INFINITE_SSTHRESH;
+    }
+
+    if (lotserver_turbo && lotspeed_turbo_ignore_active(ca)) {
+        lotspeed_consume_turbo_ignore(ca);
         return TCP_INFINITE_SSTHRESH;
     }
 
     // 温和降速
     ca->loss_count++;
-    ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
+    ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, LOTSPEED_MIN_GAIN);
 
-    return max_t(u32, tp->snd_cwnd * 7 / 10, lotserver_min_cwnd);
+    thresh = max_t(u32, tp->snd_cwnd * 7 / 10, lotserver_min_cwnd);
+    return thresh;
 }
 
 // 恢复拥塞窗口
@@ -536,9 +699,13 @@ static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
     switch (event) {
         case CA_EVENT_LOSS:
             // 发生丢包
+            if (lotserver_turbo && (!lotserver_soft_turbo || lotspeed_turbo_ignore_active(ca))) {
+                lotspeed_consume_turbo_ignore(ca);
+                break;
+            }
             ca->loss_count++;
-            if (!lotserver_turbo) {
-                ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
+            if (!lotserver_turbo || lotserver_soft_turbo) {
+                ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, LOTSPEED_MIN_GAIN);
             }
             break;
 
@@ -546,6 +713,7 @@ static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
             // 开始传输
             ca->ss_mode = true;
             ca->probe_cnt = 0;
+            lotspeed_reset_turbo_budget(ca);
             break;
 
         case CA_EVENT_CWND_RESTART:
@@ -553,6 +721,7 @@ static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
             ca->ss_mode = true;
             ca->loss_count = 0;
             ca->probe_cnt = 0;
+            lotspeed_reset_turbo_budget(ca);
             break;
 
         default:
